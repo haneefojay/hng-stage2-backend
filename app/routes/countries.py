@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import Country
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func, asc
 from app.services.refresh import refresh_countries
+from app.utils.errors import NotFoundError, InternalServerError
 from typing import Optional
 
 router = APIRouter()
@@ -30,44 +31,52 @@ async def get_countries(
     stmt = select(Country)
 
     if region:
-        stmt = stmt.where(Country.region.ilike(region))
+        stmt = stmt.where(func.lower(Country.region) == region.lower())
 
     if currency:
-        stmt = stmt.where(Country.currency_code.ilike(currency))
+        stmt = stmt.where(func.lower(Country.currency_code) == currency.lower())
 
     if sort == "gdp_desc":
-        stmt = stmt.order_by(desc(Country.estimated_gdp))
+        stmt = stmt.order_by(desc(Country.estimated_gdp).nulls_last())
     elif sort == "gdp_asc":
-        stmt = stmt.order_by(Country.estimated_gdp)
+        stmt = stmt.order_by(asc(Country.estimated_gdp).nulls_last())
 
     result = await db.execute(stmt)
-    return result.scalars().all()
+    countries = result.scalars().all()
+    
+    if not countries:
+        raise NotFoundError()
+        
+    return countries
 
 
 @router.get("/countries/{name}")
 async def get_country(name: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(Country).where(Country.name.ilike(name))
+        select(Country).filter(Country.name.ilike(name))
     )
     country = result.scalar_one_or_none()
 
     if not country:
-        raise HTTPException(status_code=404, detail="Country not found")
+        raise NotFoundError()
 
     return country
 
 
-@router.delete("/countries/{name}")
+@router.delete("/countries/{name}", status_code=204)
 async def delete_country(name: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(Country).where(Country.name.ilike(name))
+        select(Country).filter(Country.name.ilike(name))
     )
     country = result.scalar_one_or_none()
 
     if not country:
-        raise HTTPException(status_code=404, detail="Country not found")
+        raise NotFoundError()
 
-    await db.delete(country)
-    await db.commit()
-
-    return {"message": f"{name} deleted successfully"}
+    try:
+        await db.delete(country)
+        await db.commit()
+        return {"message": f"{name} deleted successfully"}
+    except Exception as e:
+        await db.rollback()
+        raise InternalServerError(f"Failed to delete country: {str(e)}")
